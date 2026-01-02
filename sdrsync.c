@@ -1,0 +1,209 @@
+#include "sdr.h"
+
+extern void *syncthread(void *arg) {
+    int i, j, nsat, isat[MAXOBS], ind[MAXSAT] = {0}, refi;
+    uint64_t sampref, sampbase, codei[MAXSAT], diffcnt, mincodei;
+    double codeid[OBSINTERPN], remcode[MAXSAT], samprefd, reftow = 0, oldreftow;
+    sdrobs_t obs[MAXSAT];
+    sdrtrk_t trk[MAXSAT] = {{0}};
+    int ret = 0;
+    char bufferSync[MSG_LENGTH];
+
+    while (!sdrstat.stopflag) {
+
+        mlock(hobsmtx);
+
+        for (i = nsat = 0; i < sdrini.nch; i++) {
+            int is_valid = 0;
+            if (sdrch[i].nav.flagdec) {
+                if (sdrch[i].sys == SYS_GLO) {
+                    /* GLONASS: check if ephemeris has valid iode */
+                    is_valid = (sdrch[i].nav.sdreph.geph.iode != 0);
+                } else {
+                    /* GPS/Galileo: check if week is set */
+                    is_valid = (sdrch[i].nav.sdreph.eph.week != 0);
+                }
+            }
+            if (is_valid) {
+                memcpy(&trk[nsat], &sdrch[i].trk, sizeof(sdrch[i].trk));
+                isat[nsat] = i;
+                nsat++;
+            }
+        }
+        unmlock(hobsmtx);
+
+        oldreftow = reftow;
+        reftow = 3600 * 24 * 7;
+        for (i = 0; i < nsat; i++) {
+            if (trk[i].tow[0] < reftow)
+                reftow = trk[i].tow[0];
+        }
+
+        if (nsat == 0 || oldreftow == reftow ||
+            ((int)(reftow * 1000) % sdrini.outms) != 0) {
+            continue;
+        }
+
+        for (i = 0; i < nsat; i++) {
+            for (j = 0; j < OBSINTERPN; j++) {
+                if (fabs(trk[i].tow[j] - reftow) < 1E-4) {
+                    ind[i] = j;
+                    break;
+                }
+            }
+            if (j == OBSINTERPN - 1 && ind[i] == 0)
+                SDRPRINTF("error:%s reftow=%.1f tow=%.1f\n",
+                          sdrch[isat[i]].satstr, trk[i].tow[OBSINTERPN - 1],
+                          reftow);
+        }
+
+        mincodei = UINT64_MAX;
+        refi = 0;
+        for (i = 0; i < nsat; i++) {
+            codei[i] = trk[i].codei[ind[i]];
+            remcode[i] = trk[i].remcout[ind[i]];
+            if (trk[i].codei[ind[i]] < mincodei) {
+                refi = i;
+                mincodei = trk[i].codei[ind[i]];
+            }
+        }
+
+        diffcnt =
+            trk[refi].cntout[ind[refi]] - sdrch[isat[refi]].nav.firstsfcnt;
+        sampref =
+            sdrch[isat[refi]].nav.firstsf +
+            (uint64_t)(sdrch[isat[refi]].nsamp *
+                       (-PTIMING / (1000 * sdrch[isat[refi]].ctime) + diffcnt));
+        sampbase =
+            trk[refi].codei[OBSINTERPN - 1] - 10 * sdrch[isat[refi]].nsamp;
+        samprefd = (double)(sampref - sampbase);
+
+        for (i = 0; i < nsat; i++) {
+            obs[i].sys = sdrch[isat[i]].sys;
+            obs[i].prn = sdrch[isat[i]].prn;
+            obs[i].week = sdrch[isat[i]].nav.sdreph.week_gpst;
+            obs[i].tow = reftow + (double)(PTIMING) / 1000;
+            obs[i].P = CLIGHT * sdrch[isat[i]].ti *
+                       ((double)(codei[i] - sampref) - remcode[i]);
+
+            uint64todouble(trk[i].codei, sampbase, OBSINTERPN, codeid);
+            obs[i].L = interp1(codeid, trk[i].L, OBSINTERPN, samprefd);
+            obs[i].D = interp1(codeid, trk[i].D, OBSINTERPN, samprefd);
+            obs[i].S = trk[i].S[0];
+        }
+
+        sdrstat.nsatValid = nsat;
+
+        mlock(hobsvecmtx);
+
+        /* Store reference satellite codei for TOA consistency calculation */
+        uint64_t ref_codei = codei[refi];
+        double ref_remcode = remcode[refi];
+        
+        /* Zero out obs_v[] only for satellites we're about to update */
+        for (int j = 0; j < MAXSAT; j++) {
+            sdrstat.obs_v[j * 14 + 1] = 0;  /* Only zero valid flags */
+        }
+        
+        for (i = 0; i < nsat; i++) {
+            int prn = obs[i].prn;
+            if (prn >= 1 && prn <= MAXSAT) {
+                int base = (prn - 1) * 14;  /* Extended from 13 to 14 */
+                sdrstat.obs_v[base + 0] = (double)prn;
+                sdrstat.obs_v[base + 1] = 1;
+                sdrstat.obs_v[base + 5] = obs[i].P;
+                sdrstat.obs_v[base + 6] = obs[i].tow;
+                sdrstat.obs_v[base + 7] = (double)obs[i].week;
+                sdrstat.obs_v[base + 8] = obs[i].S;
+                sdrstat.obs_v[base + 11] = obs[i].L;  /* Carrier phase for spoofing detection */
+                sdrstat.obs_v[base + 12] = obs[i].D;  /* Doppler frequency for spoofing detection */
+                /* Calculate codei difference relative to reference satellite (for TOA consistency)
+                   This gives time difference in sample units, can be converted to seconds */
+                sdrstat.obs_v[base + 13] = (double)(codei[i] - ref_codei) + (remcode[i] - ref_remcode);
+            }
+        }
+        unmlock(hobsvecmtx);
+
+        ret = refreshValidSatellites();
+
+        validateMeasurements();
+
+        mlock(hobsvecmtx);
+        nsat = sdrstat.nsatValid;
+        unmlock(hobsvecmtx);
+
+        if (nsat >= 4) {
+            ret = executeNavigationSolution();
+            if (ret != 0) {
+                printf("errorDetected: exiting executeNavigationSolution\n");
+            }
+        } else {
+            snprintf(
+                bufferSync, sizeof(bufferSync),
+                "%.3f  NavSolver: PVT not solved for, less than four SVs",
+                sdrstat.elapsedTime);
+            add_message(bufferSync);
+        }
+
+        if (sdrstat.printflag) {
+            FILE *fptr;
+            char *fname = "obsData.txt";
+            fptr = fopen(fname, "w");
+            if (fptr == NULL) {
+                perror("Error opening file\n");
+            }
+
+            for (int k = 0; k < nsat; k++) {
+                fprintf(fptr, "%d\n", obs[k].prn);
+                fprintf(fptr, "%.14e\n", obs[k].tow);
+                fprintf(fptr, "%.14e\n", obs[k].P);
+            }
+            for (int k = 0; k < nsat; k++) {
+                int ind = obs[k].prn - 1;
+                if (ind < 0 || ind >= sdrini.nch) {
+                    continue;
+                }
+                fprintf(fptr, "%d\n", sdrch[ind].nav.sdreph.eph.sat);
+                fprintf(fptr, "%.14e\n", 0.0);
+
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.toes);
+                fprintf(fptr, "%.14e\n", 0.0);
+
+                fprintf(fptr, "%.14e\n", sqrt(sdrch[ind].nav.sdreph.eph.A));
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.e);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.M0);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.omg);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.i0);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.OMG0);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.deln);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.idot);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.OMGd);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.cuc);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.cus);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.crc);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.crs);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.cic);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.cis);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.f0);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.f1);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.f2);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.tgd[0]);
+                fprintf(fptr, "%d\n", sdrch[ind].nav.sdreph.eph.week);
+                fprintf(fptr, "%d\n", sdrch[ind].nav.sdreph.eph.iodc);
+                fprintf(fptr, "%d\n", sdrch[ind].nav.sdreph.eph.iode);
+                fprintf(fptr, "%d\n", sdrch[ind].nav.sdreph.eph.sat);
+                fprintf(fptr, "%d\n", sdrch[ind].nav.sdreph.eph.svh);
+                fprintf(fptr, "%d\n", sdrch[ind].nav.sdreph.eph.sva);
+                fprintf(fptr, "%.14e\n", sdrch[ind].nav.sdreph.eph.fit);
+            }
+
+            SDRPRINTF("sdrData file written.\n");
+
+            fclose(fptr);
+            sdrstat.printflag = 0;
+        }
+    }
+
+    SDRPRINTF("SDR syncthread finished!\n");
+    return 0;
+}
